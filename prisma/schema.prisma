@@ -1,0 +1,202 @@
+// 自然拼读 AI 听写陪练 App — 数据模型
+// 核心设计：Word.graphemes 音素↔字母对齐数据是整个产品的地基
+// （支撑音素切分动画、拼式选择题、逐位批改、错因归类）
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ============ 用户 ============
+model User {
+  id             String   @id @default(cuid())
+  username       String   @unique @default("") // 登录名（4~20 位字母/数字/下划线/中文；历史演示用户为空串不可登录）
+  passwordHash   String   @default("") // scrypt salt:hash；空串=无密码不可登录
+  nickname       String   @default("小学员")
+  grade          Int      @default(3)
+  accentPref     String   @default("en-US") // en-US 美音 | en-GB 英音
+  ttsEngine      String   @default("browser") // browser 浏览器本地 | server 服务端AI
+  settings       String   @default("{}") // JSON 扩展设置(语速/自动播放等)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  learningEvents LearningEvent[]
+  errorLogs      ErrorLog[]
+  reviewCards    ReviewCard[]
+  dailyStats     DailyStat[]
+  sessions       Session[]
+  zhDocs         ZhDoc[]
+  dictationState DictationState?
+}
+
+// 登录会话（httpOnly cookie → token）
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// 语文默写文档：kind=draft 草稿（每用户一份，itemsJSON 存原文文本）| kind=history 最近词单（itemsJSON 存 JSON 数组，最多 5 份）
+model ZhDoc {
+  id        String   @id @default(cuid())
+  userId    String
+  kind      String // draft | history
+  itemsJSON String   @default("")
+  savedAt   DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, kind])
+  @@index([savedAt])
+}
+
+// 报听写词单选择状态（跨设备恢复）
+model DictationState {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  stateJSON String   @default("{}")
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ============ 词库 ============
+model Word {
+  id             String   @id @default(cuid())
+  headword       String   @unique
+  ipa            String // /ʃɪp/
+  phonemes       String // JSON 音素序列: ["ʃ","ɪ","p"]
+  graphemes      String // JSON 音素-字母对齐: [{"g":"sh","p":"ʃ"},{"g":"i","p":"ɪ"},{"g":"p","p":"p"}]
+  syllables      String   @default("[]") // JSON 音节: ["rab","bit"]
+  translation    String // 中文释义
+  category       String   @default("general") // 分类(动物/颜色/文具...)
+  frequency      Int      @default(50) // 使用频率 0-100
+  cefr           String   @default("A1")
+  isTricky       Boolean  @default(false) // 不规则词(如 said/one/who)
+  difficulty     Int      @default(1) // 1-5
+  rules          WordRule[]
+  unitWords      UnitWord[]
+  learningEvents LearningEvent[]
+  errorLogs      ErrorLog[]
+  reviewCards    ReviewCard[]
+  createdAt      DateTime @default(now())
+}
+
+// 拼读规则 L0-L8
+model Rule {
+  id          String     @id @default(cuid())
+  code        String     @unique // 如 L2-MAGIC-E-A
+  level       Int // 0-8 分级
+  name        String // 如 "魔法E: a_e → /eɪ/"
+  pattern     String     @default("") // 匹配模式(如 "a_e")
+  description String // 规则讲解
+  tip         String     @default("") // 记忆口诀/教学提示
+  examples    String     @default("[]") // JSON 示例词数组
+  words       WordRule[]
+}
+
+// 词-规则关联
+model WordRule {
+  wordId   String
+  ruleId   String
+  position Int     @default(0)
+  word     Word    @relation(fields: [wordId], references: [id], onDelete: Cascade)
+  rule     Rule    @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+
+  @@id([wordId, ruleId])
+}
+
+// ============ 教材同步 ============
+model Book {
+  id        String @id @default(cuid())
+  publisher String // 人教PEP / 外研社...
+  grade     Int
+  volume    String // 上册 / 下册
+  units     Unit[]
+}
+
+model Unit {
+  id     String @id @default(cuid())
+  bookId String
+  name   String // Unit 1 Hello!
+  ord    Int
+  book   Book       @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  words  UnitWord[]
+}
+
+model UnitWord {
+  unitId String
+  wordId String
+  ord    Int     @default(0)
+  unit   Unit    @relation(fields: [unitId], references: [id], onDelete: Cascade)
+  word   Word    @relation(fields: [wordId], references: [id], onDelete: Cascade)
+
+  @@id([unitId, wordId])
+}
+
+// ============ 学习记录 ============
+model LearningEvent {
+  id         String   @id @default(cuid())
+  userId     String
+  wordId     String
+  mode       String // LEARN | DICTATION | REVIEW
+  result     String // CORRECT | WRONG
+  errorTypes String   @default("[]") // JSON 错因数组
+  durationMs Int      @default(0)
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  word       Word     @relation(fields: [wordId], references: [id], onDelete: Cascade)
+}
+
+// 错词本
+model ErrorLog {
+  id         String    @id @default(cuid())
+  userId     String
+  wordId     String
+  expected   String // 正确拼写
+  actual     String // 实际拼写
+  errorType  String // PHONEME | SEGMENT | PATTERN | IRREGULAR | SUFFIX | MEMORY | HANDWRITING
+  resolved   Boolean   @default(false)
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  word       Word      @relation(fields: [wordId], references: [id], onDelete: Cascade)
+}
+
+// FSRS 间隔重复状态
+model ReviewCard {
+  id         String    @id @default(cuid())
+  userId     String
+  wordId     String
+  stability  Float     @default(0.5) // 稳定性(天)
+  difficulty Float     @default(5) // 难度 1-10
+  due        DateTime  @default(now())
+  lastReview DateTime?
+  lapses     Int       @default(0) // 遗忘次数
+  reps       Int       @default(0) // 复习次数
+  lastResult String    @default("")
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  word       Word      @relation(fields: [wordId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, wordId])
+}
+
+// 每日统计(家长报告)
+model DailyStat {
+  id             String @id @default(cuid())
+  userId         String
+  date           String // YYYY-MM-DD
+  dictationCount Int    @default(0)
+  correctCount   Int    @default(0)
+  reviewCount    Int    @default(0)
+  minutes        Float  @default(0)
+  user           User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date])
+}

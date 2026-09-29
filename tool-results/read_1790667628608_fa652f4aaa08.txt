@@ -1,0 +1,775 @@
+     1→"use client";
+     2→
+     3→import { useCallback, useEffect, useRef, useState } from "react";
+     4→import { motion } from "framer-motion";
+     5→import { toast } from "sonner";
+     6→import {
+     7→  ArrowLeft,
+     8→  BookOpen,
+     9→  BookX,
+    10→  Check,
+    11→  Home,
+    12→  Loader2,
+    13→  PencilLine,
+    14→  Play,
+    15→  RefreshCw,
+    16→  Search,
+    17→  Volume2,
+    18→} from "lucide-react";
+    19→import { Badge } from "@/components/ui/badge";
+    20→import { Button } from "@/components/ui/button";
+    21→import { Card, CardContent } from "@/components/ui/card";
+    22→import { Checkbox } from "@/components/ui/checkbox";
+    23→import { Input } from "@/components/ui/input";
+    24→import { Label } from "@/components/ui/label";
+    25→import { Progress } from "@/components/ui/progress";
+    26→import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+    27→import { ScrollArea } from "@/components/ui/scroll-area";
+    28→import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+    29→import { Skeleton } from "@/components/ui/skeleton";
+    30→import { Switch } from "@/components/ui/switch";
+    31→import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+    32→import { useSpeech } from "@/hooks/use-speech";
+    33→import {
+    34→  CATEGORY_KEYS,
+    35→  CATEGORY_LABELS,
+    36→  checkWord,
+    37→  getBooks,
+    38→  getWords,
+    39→  postDictationWords,
+    40→  type BookDTO,
+    41→  type CheckResult,
+    42→  type DictationWordsReq,
+    43→  type HintLevel,
+    44→  type Speed,
+    45→  type WordDTO,
+    46→} from "@/lib/api-client";
+    47→import { useAppStore } from "@/lib/store";
+    48→import { cn } from "@/lib/utils";
+    49→import { CheckFeedback } from "./CheckFeedback";
+    50→import { PhonemeBlocks } from "./PhonemeBlocks";
+    51→import { AccuracyRing, ErrorState, LoadingBlock } from "./shared";
+    52→
+    53→type Stage = "setup" | "writing" | "result";
+    54→
+    55→interface Attempt {
+    56→  word: WordDTO;
+    57→  correct: boolean;
+    58→  result: CheckResult;
+    59→}
+    60→
+    61→export function DictationView() {
+    62→  const [stage, setStage] = useState<Stage>("setup");
+    63→  const [queue, setQueue] = useState<WordDTO[]>([]);
+    64→  const [attempts, setAttempts] = useState<Attempt[]>([]);
+    65→  const [starting, setStarting] = useState(false);
+    66→
+    67→  const setView = useAppStore((s) => s.setView);
+    68→
+    69→  const handleStart = useCallback(async (req: DictationWordsReq) => {
+    70→    setStarting(true);
+    71→    try {
+    72→      const { words } = await postDictationWords(req);
+    73→      if (!words?.length) {
+    74→        toast("这个词单里还没有单词，换一个试试～");
+    75→        return;
+    76→      }
+    77→      setQueue(words);
+    78→      setAttempts([]);
+    79→      setStage("writing");
+    80→    } catch {
+    81→      toast.error("获取听写词单失败，请稍后再试");
+    82→    } finally {
+    83→      setStarting(false);
+    84→    }
+    85→  }, []);
+    86→
+    87→  const handleFinish = useCallback((a: Attempt[]) => {
+    88→    setAttempts(a);
+    89→    setStage("result");
+    90→  }, []);
+    91→
+    92→  const retryWrong = useCallback(() => {
+    93→    const seen = new Set<string>();
+    94→    const wrongWords: WordDTO[] = [];
+    95→    for (const a of attempts) {
+    96→      if (!a.correct && !seen.has(a.word.id)) {
+    97→        seen.add(a.word.id);
+    98→        wrongWords.push(a.word);
+    99→      }
+   100→    }
+   101→    if (!wrongWords.length) return;
+   102→    setQueue(wrongWords);
+   103→    setStage("writing");
+   104→  }, [attempts]);
+   105→
+   106→  const backToSetup = useCallback(() => {
+   107→    setQueue([]);
+   108→    setAttempts([]);
+   109→    setStage("setup");
+   110→  }, []);
+   111→
+   112→  if (stage === "writing") {
+   113→    return (
+   114→      <WritingStage
+   115→        key={queue.map((w) => w.id).join(",")}
+   116→        words={queue}
+   117→        onFinish={handleFinish}
+   118→        onQuit={backToSetup}
+   119→      />
+   120→    );
+   121→  }
+   122→
+   123→  if (stage === "result") {
+   124→    return (
+   125→      <ResultStage
+   126→        attempts={attempts}
+   127→        onRetryWrong={retryWrong}
+   128→        onChangeList={backToSetup}
+   129→        onHome={() => setView("home")}
+   130→      />
+   131→    );
+   132→  }
+   133→
+   134→  return <SetupStage starting={starting} onStart={handleStart} />;
+   135→}
+   136→
+   137→/* ============================================================
+   138→ * 阶段一：setup 选词单 + 设置
+   139→ * ============================================================ */
+   140→
+   141→function volumeLabel(v: number | string): string {
+   142→  if (v === 1 || v === "1") return "上册";
+   143→  if (v === 2 || v === "2") return "下册";
+   144→  return String(v);
+   145→}
+   146→
+   147→function SetupStage({ starting, onStart }: { starting: boolean; onStart: (req: DictationWordsReq) => void }) {
+   148→  const [tab, setTab] = useState<"unit" | "errorbook" | "custom">("unit");
+   149→
+   150→  /* 设置直接读写 store（与「设置」页共享默认值） */
+   151→  const user = useAppStore((s) => s.user);
+   152→  const setUser = useAppStore((s) => s.setUser);
+   153→  const playCount = user.settings.playCount ?? 2;
+   154→  const speed = user.settings.speed ?? "normal";
+   155→  const hintLevel = user.settings.hintLevel ?? "none";
+   156→  const autoNext = user.settings.autoNext ?? true;
+   157→  const patchSettings = (p: Partial<typeof user.settings>) =>
+   158→    setUser({ ...user, settings: { ...user.settings, ...p } });
+   159→
+   160→  /* ---- 教材同步 ---- */
+   161→  const [books, setBooks] = useState<BookDTO[] | null>(null);
+   162→  const [booksError, setBooksError] = useState(false);
+   163→  const [bookId, setBookId] = useState("");
+   164→  const [unitId, setUnitId] = useState("");
+   165→
+   166→  const loadBooks = useCallback(async () => {
+   167→    setBooksError(false);
+   168→    try {
+   169→      const data = await getBooks();
+   170→      setBooks(data.books ?? []);
+   171→    } catch {
+   172→      setBooksError(true);
+   173→    }
+   174→  }, []);
+   175→
+   176→  useEffect(() => {
+   177→    void loadBooks();
+   178→  }, [loadBooks]);
+   179→
+   180→  const book = books?.find((b) => b.id === bookId);
+   181→
+   182→  /* ---- 自由选词 ---- */
+   183→  const [customWords, setCustomWords] = useState<WordDTO[] | null>(null);
+   184→  const [customLoading, setCustomLoading] = useState(false);
+   185→  const [customError, setCustomError] = useState(false);
+   186→  const [query, setQuery] = useState("");
+   187→  const [category, setCategory] = useState("all");
+   188→  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+   189→  const reqSeq = useRef(0);
+   190→
+   191→  const loadCustom = useCallback(async () => {
+   192→    const seq = ++reqSeq.current;
+   193→    setCustomLoading(true);
+   194→    setCustomError(false);
+   195→    try {
+   196→      const data = await getWords({
+   197→        q: query || undefined,
+   198→        category: category === "all" ? undefined : category,
+   199→        limit: 50,
+   200→      });
+   201→      if (seq === reqSeq.current) setCustomWords(data.words ?? []);
+   202→    } catch {
+   203→      if (seq === reqSeq.current) setCustomError(true);
+   204→    } finally {
+   205→      if (seq === reqSeq.current) setCustomLoading(false);
+   206→    }
+   207→  }, [query, category]);
+   208→
+   209→  useEffect(() => {
+   210→    const t = setTimeout(() => void loadCustom(), 300);
+   211→    return () => clearTimeout(t);
+   212→  }, [loadCustom]);
+   213→
+   214→  const toggleWord = (id: string) =>
+   215→    setSelectedIds((prev) => {
+   216→      const next = new Set(prev);
+   217→      if (next.has(id)) next.delete(id);
+   218→      else next.add(id);
+   219→      return next;
+   220→    });
+   221→
+   222→  /* ---- 开始 ---- */
+   223→  const tryStart = () => {
+   224→    let req: DictationWordsReq | null = null;
+   225→    if (tab === "unit") {
+   226→      if (!bookId || !unitId) {
+   227→        toast("先选好教材和单元哦～");
+   228→        return;
+   229→      }
+   230→      req = { source: "unit", unitId };
+   231→    } else if (tab === "errorbook") {
+   232→      req = { source: "errorbook" };
+   233→    } else {
+   234→      if (selectedIds.size === 0) {
+   235→        toast("至少勾选 1 个单词哦～");
+   236→        return;
+   237→      }
+   238→      req = { source: "custom", wordIds: [...selectedIds] };
+   239→    }
+   240→    onStart(req);
+   241→  };
+   242→
+   243→  return (
+   244→    <div className="flex flex-col gap-5">
+   245→      <div>
+   246→        <h1 className="text-2xl font-extrabold tracking-tight md:text-3xl">报听写</h1>
+   247→        <p className="mt-1 text-sm text-muted-foreground">AI 来报听写，爸爸妈妈可以休息啦！</p>
+   248→      </div>
+   249→
+   250→      {/* 词单选择 */}
+   251→      <Card className="rounded-2xl">
+   252→        <CardContent className="p-5">
+   253→          <h2 className="mb-3 flex items-center gap-2 font-bold">
+   254→            <BookOpen className="size-4 text-primary" aria-hidden />
+   255→            选择词单
+   256→          </h2>
+   257→          <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)}>
+   258→            <TabsList className="mb-4 grid h-11 w-full grid-cols-3 rounded-xl">
+   259→              <TabsTrigger value="unit" className="rounded-lg text-sm">教材同步</TabsTrigger>
+   260→              <TabsTrigger value="errorbook" className="rounded-lg text-sm">错词本</TabsTrigger>
+   261→              <TabsTrigger value="custom" className="rounded-lg text-sm">自由选词</TabsTrigger>
+   262→            </TabsList>
+   263→
+   264→            <TabsContent value="unit" className="mt-0">
+   265→              {booksError ? (
+   266→                <ErrorState title="教材列表加载失败" onRetry={loadBooks} />
+   267→              ) : books === null ? (
+   268→                <div className="flex flex-col gap-3">
+   269→                  <Skeleton className="h-11 w-full rounded-xl" />
+   270→                  <Skeleton className="h-11 w-full rounded-xl" />
+   271→                </div>
+   272→              ) : (
+   273→                <div className="flex flex-col gap-3">
+   274→                  <div>
+   275→                    <Label htmlFor="book-select" className="mb-1.5 block text-sm">教材</Label>
+   276→                    <Select
+   277→                      value={bookId}
+   278→                      onValueChange={(v) => {
+   279→                        setBookId(v);
+   280→                        setUnitId("");
+   281→                      }}
+   282→                    >
+   283→                      <SelectTrigger id="book-select" className="h-11 w-full rounded-xl text-base">
+   284→                        <SelectValue placeholder="选择教材" />
+   285→                      </SelectTrigger>
+   286→                      <SelectContent>
+   287→                        {(books ?? []).map((b) => (
+   288→                          <SelectItem key={b.id} value={b.id}>
+   289→                            {b.publisher} · {b.grade}年级 {volumeLabel(b.volume)}
+   290→                          </SelectItem>
+   291→                        ))}
+   292→                      </SelectContent>
+   293→                    </Select>
+   294→                  </div>
+   295→                  <div>
+   296→                    <Label htmlFor="unit-select" className="mb-1.5 block text-sm">单元</Label>
+   297→                    <Select value={unitId} onValueChange={setUnitId} disabled={!book}>
+   298→                      <SelectTrigger id="unit-select" className="h-11 w-full rounded-xl text-base">
+   299→                        <SelectValue placeholder={book ? "选择单元" : "先选教材"} />
+   300→                      </SelectTrigger>
+   301→                      <SelectContent>
+   302→                        {(book?.units ?? []).map((u) => (
+   303→                          <SelectItem key={u.id} value={u.id}>
+   304→                            {u.name}（{u.wordCount} 词）
+   305→                          </SelectItem>
+   306→                        ))}
+   307→                      </SelectContent>
+   308→                    </Select>
+   309→                  </div>
+   310→                </div>
+   311→              )}
+   312→            </TabsContent>
+   313→
+   314→            <TabsContent value="errorbook" className="mt-0">
+   315→              <div className="flex items-start gap-3 rounded-xl bg-rose-50 px-4 py-3.5">
+   316→                <BookX className="mt-0.5 size-5 shrink-0 text-rose-500" aria-hidden />
+   317→                <div>
+   318→                  <p className="text-sm font-bold text-rose-700">从错词本出发</p>
+   319→                  <p className="mt-0.5 text-xs leading-relaxed text-rose-600/90">
+   320→                    把之前写错过的词再听写一遍，错过的词要亲手赢回来！
+   321→                  </p>
+   322→                </div>
+   323→              </div>
+   324→            </TabsContent>
+   325→
+   326→            <TabsContent value="custom" className="mt-0">
+   327→              <div className="flex flex-col gap-3">
+   328→                <div className="flex flex-col gap-2 sm:flex-row">
+   329→                  <div className="relative flex-1">
+   330→                    <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
+   331→                    <Input
+   332→                      value={query}
+   333→                      onChange={(e) => setQuery(e.target.value)}
+   334→                      placeholder="搜索单词"
+   335→                      className="h-11 rounded-xl pl-9 text-base"
+   336→                      aria-label="搜索单词"
+   337→                    />
+   338→                  </div>
+   339→                  <Select value={category} onValueChange={setCategory}>
+   340→                    <SelectTrigger className="h-11 w-full rounded-xl text-base sm:w-36" aria-label="按分类筛选">
+   341→                      <SelectValue />
+   342→                    </SelectTrigger>
+   343→                    <SelectContent>
+   344→                      <SelectItem value="all">全部分类</SelectItem>
+   345→                      {CATEGORY_KEYS.map((k) => (
+   346→                        <SelectItem key={k} value={k}>
+   347→                          {CATEGORY_LABELS[k]}
+   348→                        </SelectItem>
+   349→                      ))}
+   350→                    </SelectContent>
+   351→                  </Select>
+   352→                </div>
+   353→
+   354→                {customError ? (
+   355→                  <ErrorState title="词库加载失败" onRetry={loadCustom} />
+   356→                ) : customLoading ? (
+   357→                  <LoadingBlock label="正在找单词…" />
+   358→                ) : (customWords ?? []).length === 0 ? (
+   359→                  <p className="py-6 text-center text-sm text-muted-foreground">没有找到匹配的单词，换个关键词试试～</p>
+   360→                ) : (
+   361→                  <ScrollArea className="max-h-64 rounded-xl border border-border/70">
+   362→                    <div className="divide-y divide-border/60">
+   363→                      {(customWords ?? []).map((w) => (
+   364→                        <label
+   365→                          key={w.id}
+   366→                          className="flex cursor-pointer items-center gap-3 px-3 py-2.5 transition-colors hover:bg-accent"
+   367→                        >
+   368→                          <Checkbox
+   369→                            checked={selectedIds.has(w.id)}
+   370→                            onCheckedChange={() => toggleWord(w.id)}
+   371→                            aria-label={`选择 ${w.headword}`}
+   372→                            className="size-5"
+   373→                          />
+   374→                          <span className="font-mono font-bold">{w.headword}</span>
+   375→                          <span className="font-mono text-xs text-muted-foreground">/{w.ipa}/</span>
+   376→                          <span className="ml-auto truncate text-xs text-muted-foreground">{w.translation}</span>
+   377→                        </label>
+   378→                      ))}
+   379→                    </div>
+   380→                  </ScrollArea>
+   381→                )}
+   382→                <p className="text-xs text-muted-foreground">已选 {selectedIds.size} 个单词</p>
+   383→              </div>
+   384→            </TabsContent>
+   385→          </Tabs>
+   386→        </CardContent>
+   387→      </Card>
+   388→
+   389→      {/* 听写设置 */}
+   390→      <Card className="rounded-2xl">
+   391→        <CardContent className="flex flex-col gap-4 p-5">
+   392→          <h2 className="flex items-center gap-2 font-bold">
+   393→            <PencilLine className="size-4 text-primary" aria-hidden />
+   394→            听写设置
+   395→          </h2>
+   396→
+   397→          <div className="grid gap-4 sm:grid-cols-2">
+   398→            <div>
+   399→              <Label className="mb-1.5 block text-sm">每个词播放次数</Label>
+   400→              <Select value={String(playCount)} onValueChange={(v) => patchSettings({ playCount: Number(v) })}>
+   401→                <SelectTrigger className="h-11 w-full rounded-xl text-base" aria-label="播放次数">
+   402→                  <SelectValue />
+   403→                </SelectTrigger>
+   404→                <SelectContent>
+   405→                  <SelectItem value="1">1 遍</SelectItem>
+   406→                  <SelectItem value="2">2 遍</SelectItem>
+   407→                  <SelectItem value="3">3 遍</SelectItem>
+   408→                </SelectContent>
+   409→              </Select>
+   410→            </div>
+   411→            <div>
+   412→              <Label className="mb-1.5 block text-sm">提示级别</Label>
+   413→              <Select value={hintLevel} onValueChange={(v) => patchSettings({ hintLevel: v as HintLevel })}>
+   414→                <SelectTrigger className="h-11 w-full rounded-xl text-base" aria-label="提示级别">
+   415→                  <SelectValue />
+   416→                </SelectTrigger>
+   417→                <SelectContent>
+   418→                  <SelectItem value="none">无提示</SelectItem>
+   419→                  <SelectItem value="first">首字母提示</SelectItem>
+   420→                  <SelectItem value="chinese">中文释义</SelectItem>
+   421→                  <SelectItem value="phonemes">音素块</SelectItem>
+   422→                </SelectContent>
+   423→              </Select>
+   424→            </div>
+   425→          </div>
+   426→
+   427→          <div>
+   428→            <Label className="mb-1.5 block text-sm">语速</Label>
+   429→            <RadioGroup
+   430→              value={speed}
+   431→              onValueChange={(v) => patchSettings({ speed: v as Speed })}
+   432→              className="flex gap-4"
+   433→            >
+   434→              <div className="flex items-center gap-2">
+   435→                <RadioGroupItem value="normal" id="speed-normal" />
+   436→                <Label htmlFor="speed-normal" className="font-normal">正常语速</Label>
+   437→              </div>
+   438→              <div className="flex items-center gap-2">
+   439→                <RadioGroupItem value="slow" id="speed-slow" />
+   440→                <Label htmlFor="speed-slow" className="font-normal">慢速（更适合低年级）</Label>
+   441→              </div>
+   442→            </RadioGroup>
+   443→          </div>
+   444→
+   445→          <div className="flex items-center justify-between rounded-xl bg-secondary/60 px-4 py-3">
+   446→            <div>
+   447→              <Label htmlFor="auto-next" className="text-sm font-bold">答对后自动下一个</Label>
+   448→              <p className="mt-0.5 text-xs text-muted-foreground">不用点按钮，节奏更快</p>
+   449→            </div>
+   450→            <Switch id="auto-next" checked={autoNext} onCheckedChange={(v) => patchSettings({ autoNext: v })} />
+   451→          </div>
+   452→        </CardContent>
+   453→      </Card>
+   454→
+   455→      <Button
+   456→        size="lg"
+   457→        className="h-14 rounded-2xl text-lg font-bold shadow-md"
+   458→        onClick={tryStart}
+   459→        disabled={starting}
+   460→      >
+   461→        {starting ? <Loader2 className="size-5 animate-spin" aria-hidden /> : <Play className="size-5" aria-hidden />}
+   462→        {starting ? "正在准备单词…" : "开始听写"}
+   463→      </Button>
+   464→    </div>
+   465→  );
+   466→}
+   467→
+   468→/* ============================================================
+   469→ * 阶段二：writing 听写进行中
+   470→ * ============================================================ */
+   471→
+   472→function HintArea({ level, word }: { level: HintLevel; word: WordDTO }) {
+   473→  if (level === "first") {
+   474→    const masked = word.headword
+   475→      .split("")
+   476→      .map((c, i) => (i === 0 ? c : "_"))
+   477→      .join(" ");
+   478→    return <p className="font-mono text-2xl font-bold tracking-[0.25em] text-foreground/80">{masked}</p>;
+   479→  }
+   480→  if (level === "chinese") {
+   481→    return <p className="text-lg font-medium text-foreground/80">释义：{word.translation}</p>;
+   482→  }
+   483→  if (level === "phonemes") {
+   484→    return <PhonemeBlocks word={word} size="sm" hideLetters />;
+   485→  }
+   486→  return <p className="text-sm text-muted-foreground">仔细听，把它拼出来吧！</p>;
+   487→}
+   488→
+   489→function WritingStage({
+   490→  words,
+   491→  onFinish,
+   492→  onQuit,
+   493→}: {
+   494→  words: WordDTO[];
+   495→  onFinish: (attempts: Attempt[]) => void;
+   496→  onQuit: () => void;
+   497→}) {
+   498→  const { speak, speakTimes, stop, speaking } = useSpeech();
+   499→
+   500→  const settings = useAppStore((s) => s.user.settings);
+   501→  const playCount = settings.playCount ?? 2;
+   502→  const speed = settings.speed ?? "normal";
+   503→  const hintLevel = settings.hintLevel ?? "none";
+   504→  const autoNext = settings.autoNext ?? true;
+   505→
+   506→  const [index, setIndex] = useState(0);
+   507→  const [answer, setAnswer] = useState("");
+   508→  const [checking, setChecking] = useState(false);
+   509→  const [result, setResult] = useState<CheckResult | null>(null);
+   510→
+   511→  const attemptsRef = useRef<Attempt[]>([]);
+   512→  const startRef = useRef(Date.now());
+   513→  const inputRef = useRef<HTMLInputElement>(null);
+   514→
+   515→  const word = words[index];
+   516→  const progress = ((index + (result ? 1 : 0)) / Math.max(1, words.length)) * 100;
+   517→
+   518→  /* 换词时：重置计时 + 自动播放 N 遍 + 聚焦输入框 */
+   519→  useEffect(() => {
+   520→    if (!word) return;
+   521→    startRef.current = Date.now();
+   522→    if (!result) {
+   523→      speakTimes(word.headword, { times: playCount, speed, intervalMs: 1500 });
+   524→    }
+   525→    const t = setTimeout(() => inputRef.current?.focus(), 150);
+   526→    return () => clearTimeout(t);
+   527→  }, [word, result, playCount, speed, speakTimes]);
+   528→
+   529→  const submit = useCallback(async () => {
+   530→    const val = answer.trim();
+   531→    if (!val) {
+   532→      toast("先写一写再提交吧～");
+   533→      return;
+   534→    }
+   535→    if (checking || result || !word) return;
+   536→    setChecking(true);
+   537→    try {
+   538→      stop();
+   539→      const res = await checkWord({
+   540→        wordId: word.id,
+   541→        answer: val,
+   542→        mode: "DICTATION",
+   543→        durationMs: Date.now() - startRef.current,
+   544→      });
+   545→      setResult(res);
+   546→      attemptsRef.current = [
+   547→        ...attemptsRef.current,
+   548→        { word: res.word ?? word, correct: res.correct, result: res },
+   549→      ];
+   550→    } catch {
+   551→      toast.error("提交失败，请再试一次");
+   552→    } finally {
+   553→      setChecking(false);
+   554→    }
+   555→  }, [answer, checking, result, word, stop]);
+   556→
+   557→  const next = useCallback(() => {
+   558→    if (index + 1 >= words.length) {
+   559→      onFinish(attemptsRef.current);
+   560→      return;
+   561→    }
+   562→    setResult(null);
+   563→    setAnswer("");
+   564→    setIndex((i) => i + 1);
+   565→  }, [index, words.length, onFinish]);
+   566→
+   567→  /* 答对 + 自动下一个：1.5s 后前进 */
+   568→  useEffect(() => {
+   569→    if (result?.correct && autoNext) {
+   570→      const t = setTimeout(next, 1500);
+   571→      return () => clearTimeout(t);
+   572→    }
+   573→  }, [result, autoNext, next]);
+   574→
+   575→  if (!word) return null;
+   576→
+   577→  return (
+   578→    <div className="flex flex-col gap-5">
+   579→      {/* 顶部进度 */}
+   580→      <div className="flex items-center gap-3">
+   581→        <Button variant="ghost" size="icon" className="size-11 shrink-0 rounded-full" onClick={onQuit} aria-label="退出听写">
+   582→          <ArrowLeft className="size-5" aria-hidden />
+   583→        </Button>
+   584→        <Progress value={progress} className="h-2.5 flex-1" aria-label={`第 ${index + 1} 个，共 ${words.length} 个`} />
+   585→        <span className="shrink-0 text-sm font-bold text-muted-foreground">
+   586→          第 {index + 1} / {words.length} 词
+   587→        </span>
+   588→      </div>
+   589→
+   590→      <motion.div key={word.id} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }}>
+   591→        <Card className="rounded-2xl">
+   592→          <CardContent className="flex flex-col items-center gap-5 p-6">
+   593→            {/* 大播放按钮 */}
+   594→            <motion.button
+   595→              type="button"
+   596→              whileTap={{ scale: 0.92 }}
+   597→              onClick={() => void speak(word.headword, { speed })}
+   598→              aria-label={`重播 ${word.headword} 的发音`}
+   599→              className={cn(
+   600→                "flex size-20 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg transition-shadow hover:shadow-xl",
+   601→                speaking && "ring-4 ring-primary/30 ring-offset-2"
+   602→              )}
+   603→            >
+   604→              <Volume2 className="size-9" aria-hidden />
+   605→            </motion.button>
+   606→            <p className="-mt-2 text-xs text-muted-foreground">点喇叭可以再听一遍</p>
+   607→
+   608→            {/* 提示区 */}
+   609→            <div className="flex min-h-11 w-full items-center justify-center rounded-xl bg-secondary/50 px-4 py-2.5">
+   610→              <HintArea level={hintLevel} word={word} />
+   611→            </div>
+   612→
+   613→            {/* 输入 + 提交 */}
+   614→            {!result ? (
+   615→              <>
+   616→                <Input
+   617→                  ref={inputRef}
+   618→                  value={answer}
+   619→                  onChange={(e) => setAnswer(e.target.value)}
+   620→                  onKeyDown={(e) => {
+   621→                    if (e.key === "Enter") {
+   622→                      e.preventDefault();
+   623→                      void submit();
+   624→                    }
+   625→                  }}
+   626→                  disabled={checking}
+   627→                  placeholder="输入你听到的单词"
+   628→                  className="h-14 rounded-2xl text-center font-mono text-2xl font-bold"
+   629→                  autoComplete="off"
+   630→                  autoCapitalize="off"
+   631→                  autoCorrect="off"
+   632→                  spellCheck={false}
+   633→                  aria-label="拼写输入框"
+   634→                />
+   635→                <Button
+   636→                  className="h-13 w-full rounded-2xl py-4 text-base font-bold"
+   637→                  onClick={() => void submit()}
+   638→                  disabled={checking}
+   639→                >
+   640→                  {checking ? (
+   641→                    <>
+   642→                      <Loader2 className="size-5 animate-spin" aria-hidden />
+   643→                      正在批改…
+   644→                    </>
+   645→                  ) : (
+   646→                    <>
+   647→                      <Check className="size-5" aria-hidden />
+   648→                      提交（按回车也行）
+   649→                    </>
+   650→                  )}
+   651→                </Button>
+   652→              </>
+   653→            ) : (
+   654→              <>
+   655→                {/* 批改反馈 */}
+   656→                <motion.div
+   657→                  initial={{ opacity: 0, y: 8 }}
+   658→                  animate={{ opacity: 1, y: 0 }}
+   659→                  className="w-full rounded-2xl border border-border/70 bg-card p-4"
+   660→                >
+   661→                  <CheckFeedback result={result} />
+   662→                </motion.div>
+   663→                <Button
+   664→                  className="h-13 w-full rounded-2xl py-4 text-base font-bold"
+   665→                  onClick={next}
+   666→                  aria-label="下一个词"
+   667→                >
+   668→                  {index + 1 >= words.length ? "看结果" : "下一词"}
+   669→                </Button>
+   670→              </>
+   671→            )}
+   672→          </CardContent>
+   673→        </Card>
+   674→      </motion.div>
+   675→    </div>
+   676→  );
+   677→}
+   678→
+   679→/* ============================================================
+   680→ * 阶段三：result 结果页
+   681→ * ============================================================ */
+   682→
+   683→function ResultStage({
+   684→  attempts,
+   685→  onRetryWrong,
+   686→  onChangeList,
+   687→  onHome,
+   688→}: {
+   689→  attempts: Attempt[];
+   690→  onRetryWrong: () => void;
+   691→  onChangeList: () => void;
+   692→  onHome: () => void;
+   693→}) {
+   694→  const { speak } = useSpeech();
+   695→  const total = attempts.length;
+   696→  const correctCount = attempts.filter((a) => a.correct).length;
+   697→  const accuracy = total ? Math.round((correctCount / total) * 100) : 0;
+   698→  const wrong = attempts.filter((a) => !a.correct);
+   699→
+   700→  useEffect(() => {
+   701→    toast.success(`听写完成！答对 ${correctCount} / ${total}`, {
+   702→      description: accuracy >= 80 ? "太厉害了，继续保持！" : "错词可以再来一轮哦～",
+   703→    });
+   704→    // 仅在进入结果页时提示一次
+   705→  }, [correctCount, total, accuracy]);
+   706→
+   707→  const ringColor = accuracy >= 80 ? "var(--chart-3)" : accuracy >= 60 ? "var(--chart-2)" : "var(--chart-4)";
+   708→
+   709→  return (
+   710→    <div className="flex flex-col gap-5">
+   711→      <motion.div initial={{ scale: 0.92, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="flex flex-col items-center gap-3 pt-2 text-center">
+   712→        <h1 className="text-2xl font-extrabold tracking-tight">听写结果</h1>
+   713→        <AccuracyRing percent={accuracy} color={ringColor} subLabel={`答对 ${correctCount} / ${total} 词`} />
+   714→      </motion.div>
+   715→
+   716→      {wrong.length > 0 ? (
+   717→        <Card className="rounded-2xl">
+   718→          <CardContent className="p-4">
+   719→            <p className="mb-3 font-bold">错词回顾（点喇叭重听）</p>
+   720→            <div className="flex max-h-72 flex-col gap-2 overflow-y-auto nice-scrollbar pr-1">
+   721→              {wrong.map((a, i) => (
+   722→                <div key={`${a.word.id}-${i}`} className="rounded-xl border border-border/70 p-3">
+   723→                  <div className="flex items-center justify-between gap-2">
+   724→                    <div className="min-w-0">
+   725→                      <p className="truncate font-mono font-bold">
+   726→                        {a.word.headword}
+   727→                        <span className="ml-2 text-xs font-normal text-muted-foreground">/{a.word.ipa}/</span>
+   728→                      </p>
+   729→                      <p className="truncate text-xs text-muted-foreground">{a.word.translation}</p>
+   730→                    </div>
+   731→                    <Button
+   732→                      variant="outline"
+   733→                      size="icon"
+   734→                      className="size-10 shrink-0 rounded-full"
+   735→                      onClick={() => void speak(a.word.headword)}
+   736→                      aria-label={`重听 ${a.word.headword}`}
+   737→                    >
+   738→                      <Volume2 className="size-4" aria-hidden />
+   739→                    </Button>
+   740→                  </div>
+   741→                  <Badge variant="secondary" className="mt-2 rounded-full bg-rose-100 text-[11px] text-rose-700">
+   742→                    错因：{(a.result.errorTypes ?? []).length ? a.result.errorTypes.join("、") : "待分析"}
+   743→                  </Badge>
+   744→                </div>
+   745→              ))}
+   746→            </div>
+   747→          </CardContent>
+   748→        </Card>
+   749→      ) : (
+   750→        <Card className="rounded-2xl border-emerald-200 bg-emerald-50/60">
+   751→          <CardContent className="p-5 text-center text-sm font-bold text-emerald-700">
+   752→            全部答对，一个错词都没有，太棒了！
+   753→          </CardContent>
+   754→        </Card>
+   755→      )}
+   756→
+   757→      <div className="flex flex-col gap-3 sm:flex-row">
+   758→        {wrong.length > 0 ? (
+   759→          <Button className="h-12 flex-1 rounded-2xl text-base font-bold" onClick={onRetryWrong}>
+   760→            <RefreshCw className="size-4" aria-hidden />
+   761→            重听错词（{wrong.length}）
+   762→          </Button>
+   763→        ) : null}
+   764→        <Button variant="outline" className="h-12 flex-1 rounded-2xl text-base font-bold" onClick={onChangeList}>
+   765→          换个词单
+   766→        </Button>
+   767→        <Button variant="outline" className="h-12 flex-1 rounded-2xl text-base font-bold" onClick={onHome}>
+   768→          <Home className="size-4" aria-hidden />
+   769→          回首页
+   770→        </Button>
+   771→      </div>
+   772→    </div>
+   773→  );
+   774→}
+   775→
